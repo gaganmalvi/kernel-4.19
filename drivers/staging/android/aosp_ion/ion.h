@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * drivers/staging/android/ion/ion.h
+ * drivers/staging/android/aosp_ion/ion.h
  *
  * Copyright (C) 2011 Google, Inc.
  */
@@ -19,8 +19,11 @@
 #include <linux/types.h>
 #include <linux/miscdevice.h>
 
-#include "../uapi/ion.h"
-
+#ifdef CONFIG_MTK_ION
+#include "../uapi/mtk_ion/ion.h"
+#else
+#include "../uapi/aosp_ion/ion.h"
+#endif
 /**
  * struct ion_platform_heap - defines a heap in the given platform
  * @type:	type of the heap from ion_heap_type enum
@@ -316,6 +319,12 @@ void ion_page_pool_destroy(struct ion_page_pool *pool);
 struct page *ion_page_pool_alloc(struct ion_page_pool *pool);
 void ion_page_pool_free(struct ion_page_pool *pool, struct page *page);
 
+#ifdef CONFIG_ION_SYSTEM_HEAP
+long ion_page_pool_nr_pages(void);
+#else
+static inline long ion_page_pool_nr_pages(void) { return 0; }
+#endif
+
 /** ion_page_pool_shrink - shrinks the size of the memory cached in the pool
  * @pool:		the pool
  * @gfp_mask:		the memory type to reclaim
@@ -329,5 +338,13 @@ int ion_page_pool_shrink(struct ion_page_pool *pool, gfp_t gfp_mask,
 long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 
 int ion_query_heaps(struct ion_heap_query *query);
+
+struct ion_buffer *ion_drv_file_to_buffer(struct file *file);
+
+#ifdef CONFIG_ION_MODULE
+int ion_add_cma_heaps(void);
+int ion_system_heap_create(void);
+int ion_system_contig_heap_create(void);
+#endif
 
 #endif /* _ION_H */

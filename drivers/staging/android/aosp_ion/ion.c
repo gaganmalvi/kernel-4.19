@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * drivers/staging/android/ion/ion.c
+ * drivers/staging/android/aosp_ion/ion.c
  *
  * Copyright (C) 2011 Google, Inc.
  */
@@ -21,6 +21,7 @@
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
 #include <linux/mm_types.h>
+#include <linux/module.h>
 #include <linux/rbtree.h>
 #include <linux/sched/task.h>
 #include <linux/seq_file.h>
@@ -28,10 +29,14 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 
+#define CREATE_TRACE_POINTS
+#include "ion_trace.h"
 #include "ion.h"
+#include "mtk_ion.h"
 
 static struct ion_device *internal_dev;
 static int heap_id;
+static atomic_long_t total_heap_bytes;
 
 /* this function should only be called while dev->lock is held */
 static void ion_buffer_add(struct ion_device *dev,
@@ -57,6 +62,20 @@ static void ion_buffer_add(struct ion_device *dev,
 
 	rb_link_node(&buffer->node, parent, p);
 	rb_insert_color(&buffer->node, &dev->buffers);
+}
+
+static void track_buffer_created(struct ion_buffer *buffer)
+{
+	long total = atomic_long_add_return(buffer->size, &total_heap_bytes);
+
+	trace_ion_stat(buffer->sg_table, buffer->size, total);
+}
+
+static void track_buffer_destroyed(struct ion_buffer *buffer)
+{
+	long total = atomic_long_sub_return(buffer->size, &total_heap_bytes);
+
+	trace_ion_stat(buffer->sg_table, -buffer->size, total);
 }
 
 /* this function should only be called while dev->lock is held */
@@ -100,6 +119,7 @@ static struct ion_buffer *ion_buffer_create(struct ion_heap *heap,
 	mutex_lock(&dev->buffer_lock);
 	ion_buffer_add(dev, buffer);
 	mutex_unlock(&dev->buffer_lock);
+	track_buffer_created(buffer);
 	return buffer;
 
 err1:
@@ -128,6 +148,7 @@ static void _ion_buffer_destroy(struct ion_buffer *buffer)
 	mutex_lock(&dev->buffer_lock);
 	rb_erase(&buffer->node, &dev->buffers);
 	mutex_unlock(&dev->buffer_lock);
+	track_buffer_destroyed(buffer);
 
 	if (heap->flags & ION_HEAP_FLAG_DEFER_FREE)
 		ion_heap_freelist_add(heap, buffer);
@@ -189,6 +210,31 @@ static struct sg_table *dup_sg_table(struct sg_table *table)
 	return new_table;
 }
 
+static struct sg_table *dup_sec_sg_table(struct sg_table *table)
+{
+	struct sg_table *new_table;
+	int ret, i;
+	struct scatterlist *sg, *new_sg;
+
+	new_table = kzalloc(sizeof(*new_table), GFP_KERNEL);
+	if (!new_table)
+		return ERR_PTR(-ENOMEM);
+
+	ret = sg_alloc_table(new_table, table->nents, GFP_KERNEL);
+	if (ret) {
+		kfree(new_table);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	new_sg = new_table->sgl;
+	for_each_sg(table->sgl, sg, table->nents, i) {
+		memcpy(new_sg, sg, sizeof(*sg));
+		new_sg = sg_next(new_sg);
+	}
+
+	return new_table;
+}
+
 static void free_duped_table(struct sg_table *table)
 {
 	sg_free_table(table);
@@ -212,7 +258,10 @@ static int ion_dma_buf_attach(struct dma_buf *dmabuf,
 	if (!a)
 		return -ENOMEM;
 
-	table = dup_sg_table(buffer->sg_table);
+	if (buffer->heap->type == ION_HEAP_TYPE_CUSTOM)
+		table = dup_sec_sg_table(buffer->sg_table);
+	else
+		table = dup_sg_table(buffer->sg_table);
 	if (IS_ERR(table)) {
 		kfree(a);
 		return -ENOMEM;
@@ -250,6 +299,11 @@ static struct sg_table *ion_map_dma_buf(struct dma_buf_attachment *attachment,
 {
 	struct ion_dma_buf_attachment *a = attachment->priv;
 	struct sg_table *table;
+	struct ion_buffer *buffer =
+		(struct ion_buffer *)attachment->dmabuf->priv;
+
+	if (buffer->heap->type == ION_HEAP_TYPE_CUSTOM)
+		return buffer->sg_table;
 
 	table = a->table;
 
@@ -264,6 +318,12 @@ static void ion_unmap_dma_buf(struct dma_buf_attachment *attachment,
 			      struct sg_table *table,
 			      enum dma_data_direction direction)
 {
+	struct ion_buffer *buffer =
+		(struct ion_buffer *)attachment->dmabuf->priv;
+
+	if (buffer->heap->type == ION_HEAP_TYPE_CUSTOM)
+		return;
+
 	dma_unmap_sg(attachment->dev, table->sgl, table->nents, direction);
 }
 
@@ -379,6 +439,35 @@ static const struct dma_buf_ops dma_buf_ops = {
 	.unmap = ion_dma_buf_kunmap,
 };
 
+struct ion_buffer *ion_drv_file_to_buffer(struct file *file)
+{
+	struct dma_buf *dmabuf;
+	struct ion_buffer *buffer = NULL;
+	const char *pathname = NULL;
+
+	if (!file)
+		goto file2buf_exit;
+	if (!(file->f_path.dentry))
+		goto file2buf_exit;
+
+	pathname = file->f_path.dentry->d_name.name;
+	if (!pathname)
+		goto file2buf_exit;
+
+	if (strstr(pathname, "dmabuf")) {
+		dmabuf = file->private_data;
+		if (dmabuf->ops == &dma_buf_ops)
+			buffer = dmabuf->priv;
+	}
+
+file2buf_exit:
+
+	if (buffer)
+		return buffer;
+	else
+		return ERR_PTR(-EINVAL);
+}
+
 int ion_alloc(size_t len, unsigned int heap_id_mask, unsigned int flags)
 {
 	struct ion_device *dev = internal_dev;
@@ -463,7 +552,6 @@ int ion_query_heaps(struct ion_heap_query *query)
 		hdata.name[sizeof(hdata.name) - 1] = '\0';
 		hdata.type = heap->type;
 		hdata.heap_id = heap->id;
-
 		if (copy_to_user(&buffer[cnt], &hdata, sizeof(hdata))) {
 			ret = -EFAULT;
 			goto out;
@@ -524,8 +612,21 @@ static int debug_shrink_get(void *data, u64 *val)
 DEFINE_SIMPLE_ATTRIBUTE(debug_shrink_fops, debug_shrink_get,
 			debug_shrink_set, "%llu\n");
 
+static int ion_debug_heap_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, ion_sys_heap_debug_show, inode->i_private);
+}
+
+static const struct file_operations debug_heap_fops = {
+	.open = ion_debug_heap_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 void ion_device_add_heap(struct ion_heap *heap)
 {
+	struct dentry *debug_file;
 	struct ion_device *dev = internal_dev;
 	int ret;
 
@@ -554,7 +655,17 @@ void ion_device_add_heap(struct ion_heap *heap)
 	 */
 	plist_node_init(&heap->node, -heap->id);
 	plist_add(&heap->node, &dev->heaps);
+	debug_file = debugfs_create_file(heap->name, 0664,
+					 dev->debug_root, heap,
+					 &debug_heap_fops);
 
+	if (!debug_file) {
+		char buf[256], *path;
+
+		path = dentry_path(dev->debug_root, buf, 256);
+		pr_err("Failed to create heap debugfs at %s/%s\n",
+		       path, heap->name);
+	}
 	if (heap->shrinker.count_objects && heap->shrinker.scan_objects) {
 		char debug_name[64];
 
@@ -567,6 +678,56 @@ void ion_device_add_heap(struct ion_heap *heap)
 	up_write(&dev->lock);
 }
 EXPORT_SYMBOL(ion_device_add_heap);
+
+static ssize_t
+total_heaps_kb_show(struct kobject *kobj, struct kobj_attribute *attr,
+		    char *buf)
+{
+	u64 size_in_bytes = atomic_long_read(&total_heap_bytes);
+
+	return sprintf(buf, "%llu\n", div_u64(size_in_bytes, 1024));
+}
+
+static ssize_t
+total_pools_kb_show(struct kobject *kobj, struct kobj_attribute *attr,
+		    char *buf)
+{
+	u64 size_in_bytes = ion_page_pool_nr_pages() * PAGE_SIZE;
+
+	return sprintf(buf, "%llu\n", div_u64(size_in_bytes, 1024));
+}
+
+static struct kobj_attribute total_heaps_kb_attr =
+	__ATTR_RO(total_heaps_kb);
+
+static struct kobj_attribute total_pools_kb_attr =
+	__ATTR_RO(total_pools_kb);
+
+static struct attribute *ion_device_attrs[] = {
+	&total_heaps_kb_attr.attr,
+	&total_pools_kb_attr.attr,
+	NULL,
+};
+
+ATTRIBUTE_GROUPS(ion_device);
+
+static int ion_init_sysfs(void)
+{
+	struct kobject *ion_kobj;
+	int ret;
+
+	ion_kobj = kobject_create_and_add("ion", kernel_kobj);
+	if (!ion_kobj)
+		return -ENOMEM;
+
+	ret = sysfs_create_groups(ion_kobj, ion_device_groups);
+	if (ret) {
+		kobject_put(ion_kobj);
+		return ret;
+	}
+
+	return 0;
+}
 
 static int ion_device_create(void)
 {
@@ -584,8 +745,13 @@ static int ion_device_create(void)
 	ret = misc_register(&idev->dev);
 	if (ret) {
 		pr_err("ion: failed to register misc device.\n");
-		kfree(idev);
-		return ret;
+		goto err_reg;
+	}
+
+	ret = ion_init_sysfs();
+	if (ret) {
+		pr_err("ion: failed to add sysfs attributes.\n");
+		goto err_sysfs;
 	}
 
 	idev->debug_root = debugfs_create_dir("ion", NULL);
@@ -595,5 +761,43 @@ static int ion_device_create(void)
 	plist_head_init(&idev->heaps);
 	internal_dev = idev;
 	return 0;
+
+err_sysfs:
+	misc_deregister(&idev->dev);
+err_reg:
+	kfree(idev);
+	return ret;
 }
+
+#ifdef CONFIG_ION_MODULE
+int ion_module_init(void)
+{
+	int ret;
+
+	ret = ion_device_create();
+#ifdef CONFIG_ION_SYSTEM_HEAP
+	if (ret)
+		return ret;
+
+	ret = ion_system_heap_create();
+	if (ret)
+		return ret;
+
+	ret = ion_system_contig_heap_create();
+#endif
+#ifdef CONFIG_ION_CMA_HEAP
+	if (ret)
+		return ret;
+
+	ret = ion_add_cma_heaps();
+#endif
+	return ret;
+}
+
+module_init(ion_module_init);
+#else
 subsys_initcall(ion_device_create);
+#endif
+
+MODULE_LICENSE("GPL v2");
+MODULE_DESCRIPTION("Ion memory allocator");
