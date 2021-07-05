@@ -130,6 +130,17 @@ static void mmc_set_erase_size(struct mmc_card *card)
 	mmc_init_erase(card);
 }
 
+
+static void mmc_set_wp_grp_size(struct mmc_card *card)
+{
+	if (card->ext_csd.erase_group_def & 1)
+		card->wp_grp_size = card->ext_csd.hc_erase_size *
+			card->ext_csd.raw_hc_erase_gap_size;
+	else
+		card->wp_grp_size = card->csd.erase_size *
+			(card->csd.wp_grp_size + 1);
+}
+
 /*
  * Given a 128-bit response, decode to our card CSD structure.
  */
@@ -180,6 +191,7 @@ static int mmc_decode_csd(struct mmc_card *card)
 		b = UNSTUFF_BITS(resp, 37, 5);
 		csd->erase_size = (a + 1) * (b + 1);
 		csd->erase_size <<= csd->write_blkbits - 9;
+		csd->wp_grp_size = UNSTUFF_BITS(resp, 32, 5);
 	}
 
 	return 0;
@@ -622,8 +634,12 @@ static int mmc_decode_ext_csd(struct mmc_card *card, u8 *ext_csd)
 
 	/* eMMC v5 or later */
 	if (card->ext_csd.rev >= 7) {
-		memcpy(card->ext_csd.fwrev, &ext_csd[EXT_CSD_FIRMWARE_VERSION],
-		       MMC_FIRMWARE_LEN);
+		int i;
+
+		for (i = 0; i < 8; i++) {
+			card->ext_csd.fwrev[i] =
+				ext_csd[EXT_CSD_FIRMWARE_VERSION + 8 - 1 - i];
+		}
 		card->ext_csd.ffu_capable =
 			(ext_csd[EXT_CSD_SUPPORTED_MODE] & 0x1) &&
 			!(ext_csd[EXT_CSD_FW_CONFIG] & 0x1);
@@ -699,6 +715,15 @@ static int mmc_compare_ext_csds(struct mmc_card *card, unsigned bus_width)
 	u8 *bw_ext_csd;
 	int err;
 
+#if defined(CONFIG_MTK_EMMC_CQ_SUPPORT)
+	/* add for emmc reset when error happen */
+	/* return directly because compare fail seldom happens when reinit
+	 * emmc
+	 */
+	if (emmc_resetting_when_cmdq)
+		return 0;
+#endif
+
 	if (bus_width == MMC_BUS_WIDTH_1)
 		return 0;
 
@@ -767,6 +792,42 @@ static int mmc_compare_ext_csds(struct mmc_card *card, unsigned bus_width)
 	return err;
 }
 
+static ssize_t mmc_gen_unique_number_show(struct device *dev,
+		struct device_attribute *attr,
+		char *buf)
+{
+	struct mmc_card *card = mmc_dev_to_card(dev);
+	char gen_pnm[3];
+	int i;
+
+	switch (card->cid.manfid) {
+	case 0x02:	/* Sandisk	-> [3][4] */
+	case 0x45:
+		sprintf(gen_pnm, "%.*s", 2, card->cid.prod_name + 3);
+		break;
+	case 0x11:	/* Toshiba	-> [1][2] */
+	case 0x90:	/* Hynix */
+		sprintf(gen_pnm, "%.*s", 2, card->cid.prod_name + 1);
+		break;
+	case 0x13:
+	case 0xFE:	/* Micron	-> [4][5] */
+		sprintf(gen_pnm, "%.*s", 2, card->cid.prod_name + 4);
+		break;
+	case 0x15:	/* Samsung	-> [0][1] */
+	default:
+		sprintf(gen_pnm, "%.*s", 2, card->cid.prod_name + 0);
+		break;
+	}
+	/* Convert to Capital */
+	for (i = 0 ; i < 2 ; i++) {
+		if (gen_pnm[i] >= 'a' && gen_pnm[i] <= 'z')
+			gen_pnm[i] -= ('a' - 'A');
+	}
+	return sprintf(buf, "C%s%02X%08X%02X\n",
+			gen_pnm, card->cid.prv, card->cid.serial,
+			UNSTUFF_BITS(card->raw_cid, 8, 8));
+}
+
 MMC_DEV_ATTR(cid, "%08x%08x%08x%08x\n", card->raw_cid[0], card->raw_cid[1],
 	card->raw_cid[2], card->raw_cid[3]);
 MMC_DEV_ATTR(csd, "%08x%08x%08x%08x\n", card->raw_csd[0], card->raw_csd[1],
@@ -774,6 +835,7 @@ MMC_DEV_ATTR(csd, "%08x%08x%08x%08x\n", card->raw_csd[0], card->raw_csd[1],
 MMC_DEV_ATTR(date, "%02d/%04d\n", card->cid.month, card->cid.year);
 MMC_DEV_ATTR(erase_size, "%u\n", card->erase_size << 9);
 MMC_DEV_ATTR(preferred_erase_size, "%u\n", card->pref_erase << 9);
+MMC_DEV_ATTR(wp_grp_size, "%u\n", card->wp_grp_size << 9);
 MMC_DEV_ATTR(ffu_capable, "%d\n", card->ext_csd.ffu_capable);
 MMC_DEV_ATTR(hwrev, "0x%x\n", card->cid.hwrev);
 MMC_DEV_ATTR(manfid, "0x%06x\n", card->cid.manfid);
@@ -809,6 +871,7 @@ static ssize_t mmc_fwrev_show(struct device *dev,
 	}
 }
 
+static DEVICE_ATTR(unique_number, 0440, mmc_gen_unique_number_show, NULL);
 static DEVICE_ATTR(fwrev, S_IRUGO, mmc_fwrev_show, NULL);
 
 static ssize_t mmc_dsr_show(struct device *dev,
@@ -833,6 +896,7 @@ static struct attribute *mmc_std_attrs[] = {
 	&dev_attr_date.attr,
 	&dev_attr_erase_size.attr,
 	&dev_attr_preferred_erase_size.attr,
+	&dev_attr_wp_grp_size.attr,
 	&dev_attr_fwrev.attr,
 	&dev_attr_ffu_capable.attr,
 	&dev_attr_hwrev.attr,
@@ -852,6 +916,7 @@ static struct attribute *mmc_std_attrs[] = {
 	&dev_attr_rca.attr,
 	&dev_attr_dsr.attr,
 	&dev_attr_cmdq_en.attr,
+	&dev_attr_unique_number.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mmc_std);
@@ -1708,7 +1773,7 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 			mmc_set_erase_size(card);
 		}
 	}
-
+	mmc_set_wp_grp_size(card);
 	/*
 	 * Ensure eMMC user default partition is enabled
 	 */
@@ -1835,12 +1900,6 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 			err = 0;
 		}
 	}
-	/*
-	 * In some cases (e.g. RPMB or mmc_test), the Command Queue must be
-	 * disabled for a time, so a flag is needed to indicate to re-enable the
-	 * Command Queue.
-	 */
-	card->reenable_cmdq = card->ext_csd.cmdq_en;
 
 	if (card->ext_csd.cmdq_en && !host->cqe_enabled) {
 		err = host->cqe_ops->cqe_enable(host, card);
@@ -1853,6 +1912,31 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 				mmc_hostname(host));
 		}
 	}
+
+#ifdef CONFIG_MTK_EMMC_CQ_SUPPORT
+	if (card->ext_csd.cmdq_support && host->caps2 & MMC_CAP2_SWCQ) {
+		err = mmc_cmdq_enable(card);
+		if (err && err != -EBADMSG)
+			goto free_card;
+		if (err) {
+			pr_info("%s: Enabling SWCMDQ failed\n",
+				mmc_hostname(card->host));
+			card->ext_csd.cmdq_support = false;
+			card->ext_csd.cmdq_depth = 0;
+			err = 0;
+		} else {
+			host->swcq_enabled = true;
+			mmc_card_set_cmdq(card);
+		}
+	}
+#endif
+
+	/*
+	 * In some cases (e.g. RPMB or mmc_test), the Command Queue must be
+	 * disabled for a time, so a flag is needed to indicate to re-enable the
+	 * Command Queue.
+	 */
+	card->reenable_cmdq = card->ext_csd.cmdq_en;
 
 	if (host->caps2 & MMC_CAP2_AVOID_3_3V &&
 	    host->ios.signal_voltage == MMC_SIGNAL_VOLTAGE_330) {

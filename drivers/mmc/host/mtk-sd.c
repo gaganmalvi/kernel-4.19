@@ -30,6 +30,8 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/interrupt.h>
+#include <linux/arm-smccc.h>
+#include <linux/soc/mediatek/mtk_sip_svc.h>
 
 #include <linux/mmc/card.h>
 #include <linux/mmc/core.h>
@@ -38,6 +40,8 @@
 #include <linux/mmc/sd.h>
 #include <linux/mmc/sdio.h>
 #include <linux/mmc/slot-gpio.h>
+
+#include "cqhci.h"
 
 #define MAX_BD_NUM          1024
 
@@ -85,6 +89,13 @@
 #define EMMC50_CFG0      0x208
 #define EMMC50_CFG3      0x220
 #define SDC_FIFO_CFG     0x228
+
+/*--------------------------------------------------------------------------*/
+/* Top Pad Register Offset                                                  */
+/*--------------------------------------------------------------------------*/
+#define EMMC_TOP_CONTROL	0x00
+#define EMMC_TOP_CMD		0x04
+#define EMMC50_PAD_DS_TUNE	0x0c
 
 /*--------------------------------------------------------------------------*/
 /* Register Mask                                                            */
@@ -152,6 +163,7 @@
 #define MSDC_INT_DMA_BDCSERR    (0x1 << 17)	/* W1C */
 #define MSDC_INT_DMA_GPDCSERR   (0x1 << 18)	/* W1C */
 #define MSDC_INT_DMA_PROTECT    (0x1 << 19)	/* W1C */
+#define MSDC_INT_CMDQ           (0x1 << 28)	/* W1C */
 
 /* MSDC_INTEN mask */
 #define MSDC_INTEN_MMCIRQ       (0x1 << 0)	/* RW */
@@ -182,6 +194,7 @@
 /* SDC_CFG mask */
 #define SDC_CFG_SDIOINTWKUP     (0x1 << 0)	/* RW */
 #define SDC_CFG_INSWKUP         (0x1 << 1)	/* RW */
+#define SDC_CFG_WRDTOC          (0x1fff  << 2)  /* RW */
 #define SDC_CFG_BUSWIDTH        (0x3 << 16)	/* RW */
 #define SDC_CFG_SDIO            (0x1 << 19)	/* RW */
 #define SDC_CFG_SDIOIDE         (0x1 << 20)	/* RW */
@@ -228,6 +241,7 @@
 #define MSDC_PATCH_BIT_SPCPUSH    (0x1 << 29)	/* RW */
 #define MSDC_PATCH_BIT_DECRCTMO   (0x1 << 30)	/* RW */
 
+#define MSDC_PB1_BUSY_CHECK_SEL   (0x1 << 7)    /* RW */
 #define MSDC_PATCH_BIT1_CMDTA     (0x7 << 3)    /* RW */
 #define MSDC_PATCH_BIT1_STOP_DLY  (0xf << 8)    /* RW */
 
@@ -261,6 +275,23 @@
 
 #define SDC_FIFO_CFG_WRVALIDSEL   (0x1 << 24)  /* RW */
 #define SDC_FIFO_CFG_RDVALIDSEL   (0x1 << 25)  /* RW */
+
+/* EMMC_TOP_CONTROL mask */
+#define PAD_RXDLY_SEL           (0x1 << 0)      /* RW */
+#define DELAY_EN                (0x1 << 1)      /* RW */
+#define PAD_DAT_RD_RXDLY2       (0x1f << 2)     /* RW */
+#define PAD_DAT_RD_RXDLY        (0x1f << 7)     /* RW */
+#define PAD_DAT_RD_RXDLY2_SEL   (0x1 << 12)     /* RW */
+#define PAD_DAT_RD_RXDLY_SEL    (0x1 << 13)     /* RW */
+#define DATA_K_VALUE_SEL        (0x1 << 14)     /* RW */
+#define SDC_RX_ENH_EN           (0x1 << 15)     /* TW */
+
+/* EMMC_TOP_CMD mask */
+#define PAD_CMD_RXDLY2          (0x1f << 0)     /* RW */
+#define PAD_CMD_RXDLY           (0x1f << 5)     /* RW */
+#define PAD_CMD_RD_RXDLY2_SEL   (0x1 << 10)     /* RW */
+#define PAD_CMD_RD_RXDLY_SEL    (0x1 << 11)     /* RW */
+#define PAD_CMD_TX_DLY          (0x1f << 12)    /* RW */
 
 #define REQ_CMD_EIO  (0x1 << 0)
 #define REQ_CMD_TMO  (0x1 << 1)
@@ -311,6 +342,7 @@ struct mt_bdma_desc {
 	u32 ptr;
 	u32 bd_data_len;
 #define BDMA_DESC_BUFLEN	(0xffff) /* bit0 ~ bit15 */
+#define BDMA_DESC_BUFLEN_EXT	(0xffffff) /* bit0 ~ bit23 */
 };
 
 struct msdc_dma {
@@ -334,6 +366,9 @@ struct msdc_save_para {
 	u32 emmc50_cfg0;
 	u32 emmc50_cfg3;
 	u32 sdc_fifo_cfg;
+	u32 emmc_top_control;
+	u32 emmc_top_cmd;
+	u32 emmc50_pad_ds_tune;
 };
 
 struct mtk_mmc_compatible {
@@ -352,6 +387,8 @@ struct msdc_tune_para {
 	u32 iocon;
 	u32 pad_tune;
 	u32 pad_cmd_tune;
+	u32 emmc_top_control;
+	u32 emmc_top_cmd;
 };
 
 struct msdc_delay_phase {
@@ -373,6 +410,7 @@ struct msdc_host {
 	int error;
 
 	void __iomem *base;		/* host base address */
+	void __iomem *top_base;		/* host top register base address */
 
 	struct msdc_dma dma;	/* dma channel */
 	u64 dma_mask;
@@ -388,7 +426,9 @@ struct msdc_host {
 
 	struct clk *src_clk;	/* msdc source clock */
 	struct clk *h_clk;      /* msdc h_clk */
+	struct clk *bus_clk;	/* bus clock which used to access register */
 	struct clk *src_clk_cg; /* msdc source clock control gate */
+	struct clk *crypto_clk; /* msdc crypto clock */
 	u32 mclk;		/* mmc subsystem clock frequency */
 	u32 src_clk_freq;	/* source clock frequency */
 	unsigned char timing;
@@ -400,9 +440,11 @@ struct msdc_host {
 	bool hs400_cmd_resp_sel_rising;
 				 /* cmd response sample selection for HS400 */
 	bool hs400_mode;	/* current eMMC will run at hs400 mode */
+	bool cqhci;	/* support eMMC hw cmdq */
 	struct msdc_save_para save_para; /* used when gate HCLK */
 	struct msdc_tune_para def_tune_para; /* default tune setting */
 	struct msdc_tune_para saved_tune_para; /* tune result of CMD21/CMD19 */
+	struct cqhci_host *cq_host;
 };
 
 static const struct mtk_mmc_compatible mt8135_compat = {
@@ -427,6 +469,18 @@ static const struct mtk_mmc_compatible mt8173_compat = {
 	.stop_clk_fix = false,
 	.enhance_rx = false,
 	.support_64g = false,
+};
+
+static const struct mtk_mmc_compatible mt8183_compat = {
+	.clk_div_bits = 12,
+	.hs400_tune = false,
+	.pad_tune_reg = MSDC_PAD_TUNE0,
+	.async_fifo = true,
+	.data_tune = true,
+	.busy_check = true,
+	.stop_clk_fix = true,
+	.enhance_rx = true,
+	.support_64g = true,
 };
 
 static const struct mtk_mmc_compatible mt2701_compat = {
@@ -465,12 +519,26 @@ static const struct mtk_mmc_compatible mt7622_compat = {
 	.support_64g = false,
 };
 
+static const struct mtk_mmc_compatible mt6779_compat = {
+	.clk_div_bits = 12,
+	.hs400_tune = false,
+	.pad_tune_reg = MSDC_PAD_TUNE0,
+	.async_fifo = true,
+	.data_tune = true,
+	.busy_check = true,
+	.stop_clk_fix = true,
+	.enhance_rx = true,
+	.support_64g = true,
+};
+
 static const struct of_device_id msdc_of_ids[] = {
 	{ .compatible = "mediatek,mt8135-mmc", .data = &mt8135_compat},
 	{ .compatible = "mediatek,mt8173-mmc", .data = &mt8173_compat},
+	{ .compatible = "mediatek,mt8183-mmc", .data = &mt8183_compat},
 	{ .compatible = "mediatek,mt2701-mmc", .data = &mt2701_compat},
 	{ .compatible = "mediatek,mt2712-mmc", .data = &mt2712_compat},
 	{ .compatible = "mediatek,mt7622-mmc", .data = &mt7622_compat},
+	{ .compatible = "mediatek,mt6779-mmc", .data = &mt6779_compat},
 	{}
 };
 MODULE_DEVICE_TABLE(of, msdc_of_ids);
@@ -578,8 +646,14 @@ static inline void msdc_dma_setup(struct msdc_host *host, struct msdc_dma *dma,
 			bd[j].bd_info |= (upper_32_bits(dma_address) & 0xf)
 					 << 28;
 		}
-		bd[j].bd_data_len &= ~BDMA_DESC_BUFLEN;
-		bd[j].bd_data_len |= (dma_len & BDMA_DESC_BUFLEN);
+
+		if (host->dev_comp->support_64g) {
+			bd[j].bd_data_len &= ~BDMA_DESC_BUFLEN_EXT;
+			bd[j].bd_data_len |= (dma_len & BDMA_DESC_BUFLEN_EXT);
+		} else {
+			bd[j].bd_data_len &= ~BDMA_DESC_BUFLEN;
+			bd[j].bd_data_len |= (dma_len & BDMA_DESC_BUFLEN);
+		}
 
 		if (j == data->sg_count - 1) /* the last bd */
 			bd[j].bd_info |= BDMA_DESC_EOL;
@@ -627,10 +701,9 @@ static void msdc_unprepare_data(struct msdc_host *host, struct mmc_request *mrq)
 	}
 }
 
-/* clock control primitives */
-static void msdc_set_timeout(struct msdc_host *host, u32 ns, u32 clks)
+static u64 msdc_timeout_cal(struct msdc_host *host, u64 ns, u64 clks)
 {
-	u32 timeout, clk_ns;
+	u64 timeout, clk_ns;
 	u32 mode = 0;
 
 	host->timeout_ns = ns;
@@ -641,7 +714,7 @@ static void msdc_set_timeout(struct msdc_host *host, u32 ns, u32 clks)
 		clk_ns  = 1000000000UL / host->mmc->actual_clock;
 		timeout = (ns + clk_ns - 1) / clk_ns + clks;
 		/* in 1048576 sclk cycle unit */
-		timeout = (timeout + (0x1 << 20) - 1) >> 20;
+		timeout = DIV_ROUND_UP(timeout, (0x1 << 20));
 		if (host->dev_comp->clk_div_bits == 8)
 			sdr_get_field(host->base + MSDC_CFG,
 				      MSDC_CFG_CKMOD, &mode);
@@ -651,23 +724,61 @@ static void msdc_set_timeout(struct msdc_host *host, u32 ns, u32 clks)
 		/*DDR mode will double the clk cycles for data timeout */
 		timeout = mode >= 2 ? timeout * 2 : timeout;
 		timeout = timeout > 1 ? timeout - 1 : 0;
-		timeout = timeout > 255 ? 255 : timeout;
 	}
-	sdr_set_field(host->base + SDC_CFG, SDC_CFG_DTOC, timeout);
+	return timeout;
 }
 
-static void msdc_gate_clock(struct msdc_host *host)
+/* clock control primitives */
+static void msdc_set_timeout(struct msdc_host *host, u64 ns, u64 clks)
 {
+	u64 timeout;
+
+	host->timeout_ns = ns;
+	host->timeout_clks = clks;
+
+	timeout = msdc_timeout_cal(host, ns, clks);
+	sdr_set_field(host->base + SDC_CFG, SDC_CFG_DTOC,
+		(u32)(timeout > 255 ? 255 : timeout));
+}
+
+static void msdc_set_busy_timeout(struct msdc_host *host, u64 ns, u64 clks)
+{
+	u64 timeout;
+
+	timeout = msdc_timeout_cal(host, ns, clks);
+	sdr_set_field(host->base + SDC_CFG, SDC_CFG_WRDTOC,
+		(u32)(timeout > 8191 ? 8191 : timeout));
+}
+
+void msdc_gate_clock(struct mmc_host *mmc)
+{
+	struct msdc_host *host = mmc_priv(mmc);
+
+	if (!host)
+		return;
+
+	if (mmc->caps2 & MMC_CAP2_CRYPTO)
+		clk_disable_unprepare(host->crypto_clk);
 	clk_disable_unprepare(host->src_clk_cg);
 	clk_disable_unprepare(host->src_clk);
+	clk_disable_unprepare(host->bus_clk);
 	clk_disable_unprepare(host->h_clk);
 }
 
-static void msdc_ungate_clock(struct msdc_host *host)
+void msdc_ungate_clock(struct mmc_host *mmc)
 {
+	struct msdc_host *host = mmc_priv(mmc);
+
+	if (!host)
+		return;
+
 	clk_prepare_enable(host->h_clk);
+	clk_prepare_enable(host->bus_clk);
 	clk_prepare_enable(host->src_clk);
 	clk_prepare_enable(host->src_clk_cg);
+	if (mmc->caps2 & MMC_CAP2_CRYPTO)
+		clk_prepare_enable(host->crypto_clk);
+
 	while (!(readl(host->base + MSDC_CFG) & MSDC_CFG_CKSTB))
 		cpu_relax();
 }
@@ -775,12 +886,28 @@ static void msdc_set_mclk(struct msdc_host *host, unsigned char timing, u32 hz)
 	 */
 	if (host->mmc->actual_clock <= 52000000) {
 		writel(host->def_tune_para.iocon, host->base + MSDC_IOCON);
-		writel(host->def_tune_para.pad_tune, host->base + tune_reg);
+		if (host->top_base) {
+			writel(host->def_tune_para.emmc_top_control,
+			       host->top_base + EMMC_TOP_CONTROL);
+			writel(host->def_tune_para.emmc_top_cmd,
+			       host->top_base + EMMC_TOP_CMD);
+		} else {
+			writel(host->def_tune_para.pad_tune,
+			       host->base + tune_reg);
+		}
 	} else {
 		writel(host->saved_tune_para.iocon, host->base + MSDC_IOCON);
-		writel(host->saved_tune_para.pad_tune, host->base + tune_reg);
 		writel(host->saved_tune_para.pad_cmd_tune,
 		       host->base + PAD_CMD_TUNE);
+		if (host->top_base) {
+			writel(host->saved_tune_para.emmc_top_control,
+			       host->top_base + EMMC_TOP_CONTROL);
+			writel(host->saved_tune_para.emmc_top_cmd,
+			       host->top_base + EMMC_TOP_CMD);
+		} else {
+			writel(host->saved_tune_para.pad_tune,
+			       host->base + tune_reg);
+		}
 	}
 
 	if (timing == MMC_TIMING_MMC_HS400 &&
@@ -931,7 +1058,7 @@ static void msdc_request_done(struct msdc_host *host, struct mmc_request *mrq)
 	bool ret;
 
 	ret = cancel_delayed_work(&host->req_timeout);
-	if (!ret) {
+	if (!ret && in_interrupt()) {
 		/* delay work already running */
 		return;
 	}
@@ -988,11 +1115,13 @@ static bool msdc_cmd_done(struct msdc_host *host, int events,
 	}
 
 	if (!sbc_error && !(events & MSDC_INT_CMDRDY)) {
-		if (cmd->opcode != MMC_SEND_TUNING_BLOCK &&
-		    cmd->opcode != MMC_SEND_TUNING_BLOCK_HS200)
+		if (events & MSDC_INT_CMDTMO ||
+		    (cmd->opcode != MMC_SEND_TUNING_BLOCK &&
+		     cmd->opcode != MMC_SEND_TUNING_BLOCK_HS200))
 			/*
 			 * should not clear fifo/interrupt as the tune data
-			 * may have alreay come.
+			 * may have alreay come when cmd19/cmd21 gets response
+			 * CRC error.
 			 */
 			msdc_reset_hw(host);
 		if (events & MSDC_INT_RSPCRCERR) {
@@ -1053,6 +1182,7 @@ static void msdc_start_command(struct msdc_host *host,
 		struct mmc_request *mrq, struct mmc_command *cmd)
 {
 	u32 rawcmd;
+	unsigned long flags;
 
 	WARN_ON(host->cmd);
 	host->cmd = cmd;
@@ -1070,7 +1200,10 @@ static void msdc_start_command(struct msdc_host *host,
 	cmd->error = 0;
 	rawcmd = msdc_cmd_prepare_raw_cmd(host, mrq, cmd);
 
+	spin_lock_irqsave(&host->lock, flags);
 	sdr_set_bits(host->base + MSDC_INTEN, cmd_ints_mask);
+	spin_unlock_irqrestore(&host->lock, flags);
+
 	writel(cmd->arg, host->base + SDC_ARG);
 	writel(rawcmd, host->base + SDC_CMD);
 }
@@ -1290,6 +1423,62 @@ static void msdc_request_timeout(struct work_struct *work)
 	}
 }
 
+static void __msdc_enable_sdio_irq(struct mmc_host *mmc, int enb)
+{
+	unsigned long flags;
+	struct msdc_host *host = mmc_priv(mmc);
+
+	spin_lock_irqsave(&host->lock, flags);
+	if (enb)
+		sdr_set_bits(host->base + MSDC_INTEN, MSDC_INTEN_SDIOIRQ);
+	else
+		sdr_clr_bits(host->base + MSDC_INTEN, MSDC_INTEN_SDIOIRQ);
+	spin_unlock_irqrestore(&host->lock, flags);
+}
+
+static void msdc_enable_sdio_irq(struct mmc_host *mmc, int enb)
+{
+	struct msdc_host *host = mmc_priv(mmc);
+
+	__msdc_enable_sdio_irq(mmc, enb);
+
+	if (enb)
+		pm_runtime_get_noresume(host->dev);
+	else
+		pm_runtime_put_noidle(host->dev);
+}
+
+#ifdef CONFIG_MMC_CQHCI
+static irqreturn_t msdc_cmdq_irq(struct msdc_host *host, u32 intsts)
+{
+	int cmd_err = 0, dat_err = 0;
+
+	if (intsts & MSDC_INT_RSPCRCERR) {
+		cmd_err = (unsigned int)-EILSEQ;
+		pr_err("XXX CMD CRC");
+	} else if (intsts & MSDC_INT_CMDTMO) {
+		cmd_err = (unsigned int)-ETIMEDOUT;
+		pr_err("XXX CMD TIMEOUT");
+	}
+
+	if (intsts & MSDC_INT_DATCRCERR) {
+		dat_err = (unsigned int)-EILSEQ;
+		pr_err("XXX DATA CRC");
+	} else if (intsts & MSDC_INT_DATTMO) {
+		dat_err = (unsigned int)-ETIMEDOUT;
+		pr_err("XXX DATA TIMEOUT");
+	}
+
+	if (cmd_err || dat_err) {
+		pr_err("cmd_err = %d, dat_err =%d, intsts = 0x%x",
+			cmd_err, dat_err, intsts);
+		writel(intsts, host->base + MSDC_INT); /* clear interrupts */
+	}
+
+	return cqhci_irq(host->mmc, 0, cmd_err, dat_err);
+}
+#endif
+
 static irqreturn_t msdc_irq(int irq, void *dev_id)
 {
 	struct msdc_host *host = (struct msdc_host *) dev_id;
@@ -1312,8 +1501,22 @@ static irqreturn_t msdc_irq(int irq, void *dev_id)
 		data = host->data;
 		spin_unlock_irqrestore(&host->lock, flags);
 
-		if (!(events & event_mask))
+		if ((events & event_mask) & MSDC_INT_SDIOIRQ) {
+			__msdc_enable_sdio_irq(host->mmc, 0);
+			sdio_signal_irq(host->mmc);
+		}
+
+		if (!(events & (event_mask & ~MSDC_INT_SDIOIRQ)))
 			break;
+
+#ifdef CONFIG_MMC_CQHCI
+		if (host->cqhci && (events & MSDC_INT_CMDQ)) {
+			msdc_cmdq_irq(host, events);
+			/* clear interrupts */
+			writel(events, host->base + MSDC_INT);
+			return IRQ_HANDLED;
+		}
+#endif
 
 		if (!mrq) {
 			dev_err(host->dev,
@@ -1353,7 +1556,12 @@ static void msdc_init_hw(struct msdc_host *host)
 	val = readl(host->base + MSDC_INT);
 	writel(val, host->base + MSDC_INT);
 
-	writel(0, host->base + tune_reg);
+	if (host->top_base) {
+		writel(0, host->top_base + EMMC_TOP_CONTROL);
+		writel(0, host->top_base + EMMC_TOP_CMD);
+	} else {
+		writel(0, host->base + tune_reg);
+	}
 	writel(0, host->base + MSDC_IOCON);
 	sdr_set_field(host->base + MSDC_IOCON, MSDC_IOCON_DDLSEL, 0);
 	writel(0x403c0046, host->base + MSDC_PATCH_BIT);
@@ -1377,8 +1585,12 @@ static void msdc_init_hw(struct msdc_host *host)
 		sdr_set_field(host->base + MSDC_PATCH_BIT2,
 			      MSDC_PB2_RESPWAIT, 3);
 		if (host->dev_comp->enhance_rx) {
-			sdr_set_bits(host->base + SDC_ADV_CFG0,
-				     SDC_RX_ENHANCE_EN);
+			if (host->top_base)
+				sdr_set_bits(host->top_base + EMMC_TOP_CONTROL,
+					     SDC_RX_ENH_EN);
+			else
+				sdr_set_bits(host->base + SDC_ADV_CFG0,
+					     SDC_RX_ENHANCE_EN);
 		} else {
 			sdr_set_field(host->base + MSDC_PATCH_BIT2,
 				      MSDC_PB2_RESPSTSENSEL, 2);
@@ -1396,11 +1608,26 @@ static void msdc_init_hw(struct msdc_host *host)
 		sdr_set_bits(host->base + MSDC_PATCH_BIT2,
 			     MSDC_PB2_SUPPORT_64G);
 	if (host->dev_comp->data_tune) {
-		sdr_set_bits(host->base + tune_reg,
-			     MSDC_PAD_TUNE_RD_SEL | MSDC_PAD_TUNE_CMD_SEL);
+		if (host->top_base) {
+			sdr_set_bits(host->top_base + EMMC_TOP_CONTROL,
+				     PAD_DAT_RD_RXDLY_SEL);
+			sdr_clr_bits(host->top_base + EMMC_TOP_CONTROL,
+				     DATA_K_VALUE_SEL);
+			sdr_set_bits(host->top_base + EMMC_TOP_CMD,
+				     PAD_CMD_RD_RXDLY_SEL);
+		} else {
+			sdr_set_bits(host->base + tune_reg,
+				     MSDC_PAD_TUNE_RD_SEL |
+				     MSDC_PAD_TUNE_CMD_SEL);
+		}
 	} else {
 		/* choose clock tune */
-		sdr_set_bits(host->base + tune_reg, MSDC_PAD_TUNE_RXDLYSEL);
+		if (host->top_base)
+			sdr_set_bits(host->top_base + EMMC_TOP_CONTROL,
+				     PAD_RXDLY_SEL);
+		else
+			sdr_set_bits(host->base + tune_reg,
+				     MSDC_PAD_TUNE_RXDLYSEL);
 	}
 
 	/* Configure to enable SDIO mode.
@@ -1408,16 +1635,30 @@ static void msdc_init_hw(struct msdc_host *host)
 	 */
 	sdr_set_bits(host->base + SDC_CFG, SDC_CFG_SDIO);
 
-	/* disable detect SDIO device interrupt function */
-	sdr_clr_bits(host->base + SDC_CFG, SDC_CFG_SDIOIDE);
+	/* Config SDIO device detect interrupt function */
+	if (host->mmc->caps & MMC_CAP_SDIO_IRQ)
+		sdr_set_bits(host->base + SDC_CFG, SDC_CFG_SDIOIDE);
+	else
+		sdr_clr_bits(host->base + SDC_CFG, SDC_CFG_SDIOIDE);
 
 	/* Configure to default data timeout */
 	sdr_set_field(host->base + SDC_CFG, SDC_CFG_DTOC, 3);
 
 	host->def_tune_para.iocon = readl(host->base + MSDC_IOCON);
-	host->def_tune_para.pad_tune = readl(host->base + tune_reg);
 	host->saved_tune_para.iocon = readl(host->base + MSDC_IOCON);
-	host->saved_tune_para.pad_tune = readl(host->base + tune_reg);
+	if (host->top_base) {
+		host->def_tune_para.emmc_top_control =
+			readl(host->top_base + EMMC_TOP_CONTROL);
+		host->def_tune_para.emmc_top_cmd =
+			readl(host->top_base + EMMC_TOP_CMD);
+		host->saved_tune_para.emmc_top_control =
+			readl(host->top_base + EMMC_TOP_CONTROL);
+		host->saved_tune_para.emmc_top_cmd =
+			readl(host->top_base + EMMC_TOP_CMD);
+	} else {
+		host->def_tune_para.pad_tune = readl(host->base + tune_reg);
+		host->saved_tune_para.pad_tune = readl(host->base + tune_reg);
+	}
 	dev_dbg(host->dev, "init hardware done!");
 }
 
@@ -1565,6 +1806,30 @@ static struct msdc_delay_phase get_best_delay(struct msdc_host *host, u32 delay)
 	return delay_phase;
 }
 
+static inline void msdc_set_cmd_delay(struct msdc_host *host, u32 value)
+{
+	u32 tune_reg = host->dev_comp->pad_tune_reg;
+
+	if (host->top_base)
+		sdr_set_field(host->top_base + EMMC_TOP_CMD, PAD_CMD_RXDLY,
+			      value);
+	else
+		sdr_set_field(host->base + tune_reg, MSDC_PAD_TUNE_CMDRDLY,
+			      value);
+}
+
+static inline void msdc_set_data_delay(struct msdc_host *host, u32 value)
+{
+	u32 tune_reg = host->dev_comp->pad_tune_reg;
+
+	if (host->top_base)
+		sdr_set_field(host->top_base + EMMC_TOP_CONTROL,
+			      PAD_DAT_RD_RXDLY, value);
+	else
+		sdr_set_field(host->base + tune_reg, MSDC_PAD_TUNE_DATRRDLY,
+			      value);
+}
+
 static int msdc_tune_response(struct mmc_host *mmc, u32 opcode)
 {
 	struct msdc_host *host = mmc_priv(mmc);
@@ -1585,8 +1850,7 @@ static int msdc_tune_response(struct mmc_host *mmc, u32 opcode)
 
 	sdr_clr_bits(host->base + MSDC_IOCON, MSDC_IOCON_RSPL);
 	for (i = 0 ; i < PAD_DELAY_MAX; i++) {
-		sdr_set_field(host->base + tune_reg,
-			      MSDC_PAD_TUNE_CMDRDLY, i);
+		msdc_set_cmd_delay(host, i);
 		/*
 		 * Using the same parameters, it may sometimes pass the test,
 		 * but sometimes it may fail. To make sure the parameters are
@@ -1610,8 +1874,7 @@ static int msdc_tune_response(struct mmc_host *mmc, u32 opcode)
 
 	sdr_set_bits(host->base + MSDC_IOCON, MSDC_IOCON_RSPL);
 	for (i = 0; i < PAD_DELAY_MAX; i++) {
-		sdr_set_field(host->base + tune_reg,
-			      MSDC_PAD_TUNE_CMDRDLY, i);
+		msdc_set_cmd_delay(host, i);
 		/*
 		 * Using the same parameters, it may sometimes pass the test,
 		 * but sometimes it may fail. To make sure the parameters are
@@ -1635,15 +1898,13 @@ skip_fall:
 		final_maxlen = final_fall_delay.maxlen;
 	if (final_maxlen == final_rise_delay.maxlen) {
 		sdr_clr_bits(host->base + MSDC_IOCON, MSDC_IOCON_RSPL);
-		sdr_set_field(host->base + tune_reg, MSDC_PAD_TUNE_CMDRDLY,
-			      final_rise_delay.final_phase);
 		final_delay = final_rise_delay.final_phase;
 	} else {
 		sdr_set_bits(host->base + MSDC_IOCON, MSDC_IOCON_RSPL);
-		sdr_set_field(host->base + tune_reg, MSDC_PAD_TUNE_CMDRDLY,
-			      final_fall_delay.final_phase);
 		final_delay = final_fall_delay.final_phase;
 	}
+	msdc_set_cmd_delay(host, final_delay);
+
 	if (host->dev_comp->async_fifo || host->hs200_cmd_int_delay)
 		goto skip_internal;
 
@@ -1719,7 +1980,6 @@ static int msdc_tune_data(struct mmc_host *mmc, u32 opcode)
 	u32 rise_delay = 0, fall_delay = 0;
 	struct msdc_delay_phase final_rise_delay, final_fall_delay = { 0,};
 	u8 final_delay, final_maxlen;
-	u32 tune_reg = host->dev_comp->pad_tune_reg;
 	int i, ret;
 
 	sdr_set_field(host->base + MSDC_PATCH_BIT, MSDC_INT_DAT_LATCH_CK_SEL,
@@ -1727,8 +1987,7 @@ static int msdc_tune_data(struct mmc_host *mmc, u32 opcode)
 	sdr_clr_bits(host->base + MSDC_IOCON, MSDC_IOCON_DSPL);
 	sdr_clr_bits(host->base + MSDC_IOCON, MSDC_IOCON_W_DSPL);
 	for (i = 0 ; i < PAD_DELAY_MAX; i++) {
-		sdr_set_field(host->base + tune_reg,
-			      MSDC_PAD_TUNE_DATRRDLY, i);
+		msdc_set_data_delay(host, i);
 		ret = mmc_send_tuning(mmc, opcode, NULL);
 		if (!ret)
 			rise_delay |= (1 << i);
@@ -1742,8 +2001,7 @@ static int msdc_tune_data(struct mmc_host *mmc, u32 opcode)
 	sdr_set_bits(host->base + MSDC_IOCON, MSDC_IOCON_DSPL);
 	sdr_set_bits(host->base + MSDC_IOCON, MSDC_IOCON_W_DSPL);
 	for (i = 0; i < PAD_DELAY_MAX; i++) {
-		sdr_set_field(host->base + tune_reg,
-			      MSDC_PAD_TUNE_DATRRDLY, i);
+		msdc_set_data_delay(host, i);
 		ret = mmc_send_tuning(mmc, opcode, NULL);
 		if (!ret)
 			fall_delay |= (1 << i);
@@ -1755,20 +2013,79 @@ skip_fall:
 	if (final_maxlen == final_rise_delay.maxlen) {
 		sdr_clr_bits(host->base + MSDC_IOCON, MSDC_IOCON_DSPL);
 		sdr_clr_bits(host->base + MSDC_IOCON, MSDC_IOCON_W_DSPL);
-		sdr_set_field(host->base + tune_reg,
-			      MSDC_PAD_TUNE_DATRRDLY,
-			      final_rise_delay.final_phase);
 		final_delay = final_rise_delay.final_phase;
 	} else {
 		sdr_set_bits(host->base + MSDC_IOCON, MSDC_IOCON_DSPL);
 		sdr_set_bits(host->base + MSDC_IOCON, MSDC_IOCON_W_DSPL);
-		sdr_set_field(host->base + tune_reg,
-			      MSDC_PAD_TUNE_DATRRDLY,
-			      final_fall_delay.final_phase);
+		final_delay = final_fall_delay.final_phase;
+	}
+	msdc_set_data_delay(host, final_delay);
+
+	dev_dbg(host->dev, "Final data pad delay: %x\n", final_delay);
+	return final_delay == 0xff ? -EIO : 0;
+}
+
+/*
+ * MSDC IP which supports data tune + async fifo can do CMD/DAT tune
+ * together, which can save the tuning time.
+ */
+static int msdc_tune_together(struct mmc_host *mmc, u32 opcode)
+{
+	struct msdc_host *host = mmc_priv(mmc);
+	u32 rise_delay = 0, fall_delay = 0;
+	struct msdc_delay_phase final_rise_delay, final_fall_delay = { 0,};
+	u8 final_delay, final_maxlen;
+	int i, ret;
+
+	sdr_set_field(host->base + MSDC_PATCH_BIT, MSDC_INT_DAT_LATCH_CK_SEL,
+		      host->latch_ck);
+
+	sdr_clr_bits(host->base + MSDC_IOCON, MSDC_IOCON_RSPL);
+	sdr_clr_bits(host->base + MSDC_IOCON,
+		     MSDC_IOCON_DSPL | MSDC_IOCON_W_DSPL);
+	for (i = 0 ; i < PAD_DELAY_MAX; i++) {
+		msdc_set_cmd_delay(host, i);
+		msdc_set_data_delay(host, i);
+		ret = mmc_send_tuning(mmc, opcode, NULL);
+		if (!ret)
+			rise_delay |= (1 << i);
+	}
+	final_rise_delay = get_best_delay(host, rise_delay);
+	/* if rising edge has enough margin, then do not scan falling edge */
+	if (final_rise_delay.maxlen >= 12 ||
+	    (final_rise_delay.start == 0 && final_rise_delay.maxlen >= 4))
+		goto skip_fall;
+
+	sdr_set_bits(host->base + MSDC_IOCON, MSDC_IOCON_RSPL);
+	sdr_set_bits(host->base + MSDC_IOCON,
+		     MSDC_IOCON_DSPL | MSDC_IOCON_W_DSPL);
+	for (i = 0; i < PAD_DELAY_MAX; i++) {
+		msdc_set_cmd_delay(host, i);
+		msdc_set_data_delay(host, i);
+		ret = mmc_send_tuning(mmc, opcode, NULL);
+		if (!ret)
+			fall_delay |= (1 << i);
+	}
+	final_fall_delay = get_best_delay(host, fall_delay);
+
+skip_fall:
+	final_maxlen = max(final_rise_delay.maxlen, final_fall_delay.maxlen);
+	if (final_maxlen == final_rise_delay.maxlen) {
+		sdr_clr_bits(host->base + MSDC_IOCON, MSDC_IOCON_RSPL);
+		sdr_clr_bits(host->base + MSDC_IOCON,
+			     MSDC_IOCON_DSPL | MSDC_IOCON_W_DSPL);
+		final_delay = final_rise_delay.final_phase;
+	} else {
+		sdr_set_bits(host->base + MSDC_IOCON, MSDC_IOCON_RSPL);
+		sdr_set_bits(host->base + MSDC_IOCON,
+			     MSDC_IOCON_DSPL | MSDC_IOCON_W_DSPL);
 		final_delay = final_fall_delay.final_phase;
 	}
 
-	dev_dbg(host->dev, "Final data pad delay: %x\n", final_delay);
+	msdc_set_cmd_delay(host, final_delay);
+	msdc_set_data_delay(host, final_delay);
+
+	dev_dbg(host->dev, "Final pad delay: %x\n", final_delay);
 	return final_delay == 0xff ? -EIO : 0;
 }
 
@@ -1778,6 +2095,15 @@ static int msdc_execute_tuning(struct mmc_host *mmc, u32 opcode)
 	int ret;
 	u32 tune_reg = host->dev_comp->pad_tune_reg;
 
+	if (host->dev_comp->data_tune && host->dev_comp->async_fifo) {
+		ret = msdc_tune_together(mmc, opcode);
+		if (host->hs400_mode) {
+			sdr_clr_bits(host->base + MSDC_IOCON,
+				     MSDC_IOCON_DSPL | MSDC_IOCON_W_DSPL);
+			msdc_set_data_delay(host, 0);
+		}
+		goto tune_done;
+	}
 	if (host->hs400_mode &&
 	    host->dev_comp->hs400_tune)
 		ret = hs400_tune_response(mmc, opcode);
@@ -1793,9 +2119,16 @@ static int msdc_execute_tuning(struct mmc_host *mmc, u32 opcode)
 			dev_err(host->dev, "Tune data fail!\n");
 	}
 
+tune_done:
 	host->saved_tune_para.iocon = readl(host->base + MSDC_IOCON);
 	host->saved_tune_para.pad_tune = readl(host->base + tune_reg);
 	host->saved_tune_para.pad_cmd_tune = readl(host->base + PAD_CMD_TUNE);
+	if (host->top_base) {
+		host->saved_tune_para.emmc_top_control = readl(host->top_base +
+				EMMC_TOP_CONTROL);
+		host->saved_tune_para.emmc_top_cmd = readl(host->top_base +
+				EMMC_TOP_CMD);
+	}
 	return ret;
 }
 
@@ -1804,7 +2137,11 @@ static int msdc_prepare_hs400_tuning(struct mmc_host *mmc, struct mmc_ios *ios)
 	struct msdc_host *host = mmc_priv(mmc);
 	host->hs400_mode = true;
 
-	writel(host->hs400_ds_delay, host->base + PAD_DS_TUNE);
+	if (host->top_base)
+		writel(host->hs400_ds_delay,
+		       host->top_base + EMMC50_PAD_DS_TUNE);
+	else
+		writel(host->hs400_ds_delay, host->base + PAD_DS_TUNE);
 	/* hs400 mode must set it to 0 */
 	sdr_clr_bits(host->base + MSDC_PATCH_BIT2, MSDC_PATCH_BIT2_CFGCRCSTS);
 	/* to improve read performance, set outstanding to 2 */
@@ -1822,6 +2159,41 @@ static void msdc_hw_reset(struct mmc_host *mmc)
 	sdr_clr_bits(host->base + EMMC_IOCON, 1);
 }
 
+static void msdc_ack_sdio_irq(struct mmc_host *mmc)
+{
+	__msdc_enable_sdio_irq(mmc, 1);
+}
+
+static void msdc_cqe_enable(struct mmc_host *mmc)
+{
+	struct msdc_host *host = mmc_priv(mmc);
+
+	/* enable cmdq irq */
+	writel(MSDC_INT_CMDQ, host->base + MSDC_INTEN);
+	/* enable busy check */
+	sdr_set_bits(host->base + MSDC_PATCH_BIT1, MSDC_PB1_BUSY_CHECK_SEL);
+	/* default write data / busy timeout 20s */
+	msdc_set_busy_timeout(host, 20 * 1000000000ULL, 0);
+	/* default read data timeout 100ms */
+	msdc_set_timeout(host, 100 * 1000000, 0);
+}
+
+void msdc_cqe_disable(struct mmc_host *mmc, bool recovery)
+{
+	struct msdc_host *host = mmc_priv(mmc);
+
+	/* disable cmdq irq */
+	sdr_clr_bits(host->base + MSDC_INTEN, MSDC_INT_CMDQ);
+	/* disable busy check */
+	sdr_clr_bits(host->base + MSDC_PATCH_BIT1, MSDC_PB1_BUSY_CHECK_SEL);
+
+	if (recovery) {
+		sdr_set_field(host->base + MSDC_DMA_CTRL,
+			MSDC_DMA_CTRL_STOP, 1);
+		msdc_reset_hw(host);
+	}
+}
+
 static const struct mmc_host_ops mt_msdc_ops = {
 	.post_req = msdc_post_req,
 	.pre_req = msdc_pre_req,
@@ -1829,12 +2201,20 @@ static const struct mmc_host_ops mt_msdc_ops = {
 	.set_ios = msdc_ops_set_ios,
 	.get_ro = mmc_gpio_get_ro,
 	.get_cd = mmc_gpio_get_cd,
+	.enable_sdio_irq = msdc_enable_sdio_irq,
+	.ack_sdio_irq = msdc_ack_sdio_irq,
 	.start_signal_voltage_switch = msdc_ops_switch_volt,
 	.card_busy = msdc_card_busy,
 	.execute_tuning = msdc_execute_tuning,
 	.prepare_hs400_tuning = msdc_prepare_hs400_tuning,
 	.hw_reset = msdc_hw_reset,
 };
+
+static const struct cqhci_host_ops msdc_cmdq_ops = {
+	.enable         = msdc_cqe_enable,
+	.disable        = msdc_cqe_disable,
+};
+
 
 static void msdc_of_property_parse(struct platform_device *pdev,
 				   struct msdc_host *host)
@@ -1856,6 +2236,12 @@ static void msdc_of_property_parse(struct platform_device *pdev,
 		host->hs400_cmd_resp_sel_rising = true;
 	else
 		host->hs400_cmd_resp_sel_rising = false;
+
+	if (of_property_read_bool(pdev->dev.of_node,
+				  "mediatek,cqhci"))
+		host->cqhci = true;
+	else
+		host->cqhci = false;
 }
 
 static int msdc_drv_probe(struct platform_device *pdev)
@@ -1863,6 +2249,7 @@ static int msdc_drv_probe(struct platform_device *pdev)
 	struct mmc_host *mmc;
 	struct msdc_host *host;
 	struct resource *res;
+	struct arm_smccc_res smccc_res;
 	int ret;
 
 	if (!pdev->dev.of_node) {
@@ -1880,12 +2267,23 @@ static int msdc_drv_probe(struct platform_device *pdev)
 	if (ret)
 		goto host_free;
 
+	host->mmc = mmc;
+#ifdef CONFIG_MMC_CRYPTO
+	if (host->mmc->caps2 & MMC_CAP2_NO_SD)
+		host->mmc->caps2 |= MMC_CAP2_CRYPTO;
+#endif
+
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	host->base = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(host->base)) {
 		ret = PTR_ERR(host->base);
 		goto host_free;
 	}
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	host->top_base = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(host->top_base))
+		host->top_base = NULL;
 
 	ret = mmc_regulator_get_supply(mmc);
 	if (ret)
@@ -1903,10 +2301,19 @@ static int msdc_drv_probe(struct platform_device *pdev)
 		goto host_free;
 	}
 
+	host->bus_clk = devm_clk_get(&pdev->dev, "bus_clk");
+	if (IS_ERR(host->bus_clk))
+		host->bus_clk = NULL;
 	/*source clock control gate is optional clock*/
 	host->src_clk_cg = devm_clk_get(&pdev->dev, "source_cg");
 	if (IS_ERR(host->src_clk_cg))
 		host->src_clk_cg = NULL;
+
+	if (host->mmc->caps2 & MMC_CAP2_CRYPTO) {
+		host->crypto_clk = devm_clk_get(&pdev->dev, "crypto_clk");
+		if (IS_ERR(host->crypto_clk))
+			host->crypto_clk = NULL;
+	}
 
 	host->irq = platform_get_irq(pdev, 0);
 	if (host->irq < 0) {
@@ -1939,7 +2346,6 @@ static int msdc_drv_probe(struct platform_device *pdev)
 
 	host->dev = &pdev->dev;
 	host->dev_comp = of_device_get_match_data(&pdev->dev);
-	host->mmc = mmc;
 	host->src_clk_freq = clk_get_rate(host->src_clk);
 	/* Set host parameters to mmc */
 	mmc->ops = &mt_msdc_ops;
@@ -1948,10 +2354,18 @@ static int msdc_drv_probe(struct platform_device *pdev)
 	else
 		mmc->f_min = DIV_ROUND_UP(host->src_clk_freq, 4 * 4095);
 
+	if (mmc->caps & MMC_CAP_SDIO_IRQ)
+		mmc->caps2 |= MMC_CAP2_SDIO_IRQ_NOTHREAD;
+
 	mmc->caps |= MMC_CAP_ERASE | MMC_CAP_CMD23;
+	if (host->cqhci)
+		mmc->caps2 |= MMC_CAP2_CQE | MMC_CAP2_CQE_DCMD;
 	/* MMC core transfer sizes tunable parameters */
 	mmc->max_segs = MAX_BD_NUM;
-	mmc->max_seg_size = BDMA_DESC_BUFLEN;
+	if (host->dev_comp->support_64g)
+		mmc->max_seg_size = BDMA_DESC_BUFLEN_EXT;
+	else
+		mmc->max_seg_size = BDMA_DESC_BUFLEN;
 	mmc->max_blk_size = 2048;
 	mmc->max_req_size = 512 * 1024;
 	mmc->max_blk_count = mmc->max_req_size / 512;
@@ -1960,6 +2374,31 @@ static int msdc_drv_probe(struct platform_device *pdev)
 	else
 		host->dma_mask = DMA_BIT_MASK(32);
 	mmc_dev(mmc)->dma_mask = &host->dma_mask;
+
+	msdc_ungate_clock(mmc);
+#ifdef CONFIG_MMC_CQHCI
+	if (host->cqhci) {
+		host->cq_host = devm_kzalloc(host->mmc->parent,
+			       sizeof(*host->cq_host), GFP_KERNEL);
+		host->cq_host->caps |= CQHCI_TASK_DESC_SZ_128;
+		host->cq_host->quirks |= CQHCI_QUIRK_DIS_BEFORE_NON_CQ_CMD;
+		host->cq_host->mmio = host->base + 0x800;
+		host->cq_host->ops = &msdc_cmdq_ops;
+		cqhci_init(host->cq_host, mmc, true);
+		host->cq_host->mmc->max_segs = 128;
+		/* cqhci 16bit length */
+		/* 0 size, means 65536 so we don't have to -1 here */
+		host->cq_host->mmc->max_seg_size = 64 * 1024;
+	}
+	/*
+	 * 1: MSDC_AES_CTL_INIT
+	 * 4: cap_id, no-meaning
+	 * 1: cfg_id, we choose the second cfg group
+	 */
+	if (host->mmc->caps2 & MMC_CAP2_CRYPTO)
+		arm_smccc_smc(MTK_SIP_KERNEL_HW_FDE_MSDC_CTL,
+			1, 4, 1, 0, 0, 0, 0, &smccc_res);
+#endif
 
 	host->timeout_clks = 3 * 1048576;
 	host->dma.gpd = dma_alloc_coherent(&pdev->dev,
@@ -1977,7 +2416,6 @@ static int msdc_drv_probe(struct platform_device *pdev)
 	spin_lock_init(&host->lock);
 
 	platform_set_drvdata(pdev, mmc);
-	msdc_ungate_clock(host);
 	msdc_init_hw(host);
 
 	ret = devm_request_irq(&pdev->dev, host->irq, msdc_irq,
@@ -2000,7 +2438,7 @@ end:
 release:
 	platform_set_drvdata(pdev, NULL);
 	msdc_deinit_hw(host);
-	msdc_gate_clock(host);
+	msdc_gate_clock(mmc);
 release_mem:
 	if (host->dma.gpd)
 		dma_free_coherent(&pdev->dev,
@@ -2029,7 +2467,7 @@ static int msdc_drv_remove(struct platform_device *pdev)
 	platform_set_drvdata(pdev, NULL);
 	mmc_remove_host(host->mmc);
 	msdc_deinit_hw(host);
-	msdc_gate_clock(host);
+	msdc_gate_clock(mmc);
 
 	pm_runtime_disable(host->dev);
 	pm_runtime_put_noidle(host->dev);
@@ -2052,7 +2490,6 @@ static void msdc_save_reg(struct msdc_host *host)
 	host->save_para.msdc_cfg = readl(host->base + MSDC_CFG);
 	host->save_para.iocon = readl(host->base + MSDC_IOCON);
 	host->save_para.sdc_cfg = readl(host->base + SDC_CFG);
-	host->save_para.pad_tune = readl(host->base + tune_reg);
 	host->save_para.patch_bit0 = readl(host->base + MSDC_PATCH_BIT);
 	host->save_para.patch_bit1 = readl(host->base + MSDC_PATCH_BIT1);
 	host->save_para.patch_bit2 = readl(host->base + MSDC_PATCH_BIT2);
@@ -2061,6 +2498,16 @@ static void msdc_save_reg(struct msdc_host *host)
 	host->save_para.emmc50_cfg0 = readl(host->base + EMMC50_CFG0);
 	host->save_para.emmc50_cfg3 = readl(host->base + EMMC50_CFG3);
 	host->save_para.sdc_fifo_cfg = readl(host->base + SDC_FIFO_CFG);
+	if (host->top_base) {
+		host->save_para.emmc_top_control =
+			readl(host->top_base + EMMC_TOP_CONTROL);
+		host->save_para.emmc_top_cmd =
+			readl(host->top_base + EMMC_TOP_CMD);
+		host->save_para.emmc50_pad_ds_tune =
+			readl(host->top_base + EMMC50_PAD_DS_TUNE);
+	} else {
+		host->save_para.pad_tune = readl(host->base + tune_reg);
+	}
 }
 
 static void msdc_restore_reg(struct msdc_host *host)
@@ -2070,7 +2517,6 @@ static void msdc_restore_reg(struct msdc_host *host)
 	writel(host->save_para.msdc_cfg, host->base + MSDC_CFG);
 	writel(host->save_para.iocon, host->base + MSDC_IOCON);
 	writel(host->save_para.sdc_cfg, host->base + SDC_CFG);
-	writel(host->save_para.pad_tune, host->base + tune_reg);
 	writel(host->save_para.patch_bit0, host->base + MSDC_PATCH_BIT);
 	writel(host->save_para.patch_bit1, host->base + MSDC_PATCH_BIT1);
 	writel(host->save_para.patch_bit2, host->base + MSDC_PATCH_BIT2);
@@ -2079,6 +2525,16 @@ static void msdc_restore_reg(struct msdc_host *host)
 	writel(host->save_para.emmc50_cfg0, host->base + EMMC50_CFG0);
 	writel(host->save_para.emmc50_cfg3, host->base + EMMC50_CFG3);
 	writel(host->save_para.sdc_fifo_cfg, host->base + SDC_FIFO_CFG);
+	if (host->top_base) {
+		writel(host->save_para.emmc_top_control,
+		       host->top_base + EMMC_TOP_CONTROL);
+		writel(host->save_para.emmc_top_cmd,
+		       host->top_base + EMMC_TOP_CMD);
+		writel(host->save_para.emmc50_pad_ds_tune,
+		       host->top_base + EMMC50_PAD_DS_TUNE);
+	} else {
+		writel(host->save_para.pad_tune, host->base + tune_reg);
+	}
 }
 
 static int msdc_runtime_suspend(struct device *dev)
@@ -2086,8 +2542,13 @@ static int msdc_runtime_suspend(struct device *dev)
 	struct mmc_host *mmc = dev_get_drvdata(dev);
 	struct msdc_host *host = mmc_priv(mmc);
 
+#ifdef CONFIG_MMC_CQHCI
+	if (mmc->caps2 & MMC_CAP2_CQE)
+		cqhci_suspend(mmc);
+#endif
+
 	msdc_save_reg(host);
-	msdc_gate_clock(host);
+	msdc_gate_clock(mmc);
 	return 0;
 }
 
@@ -2095,9 +2556,23 @@ static int msdc_runtime_resume(struct device *dev)
 {
 	struct mmc_host *mmc = dev_get_drvdata(dev);
 	struct msdc_host *host = mmc_priv(mmc);
+	struct arm_smccc_res smccc_res;
 
-	msdc_ungate_clock(host);
+	msdc_ungate_clock(mmc);
 	msdc_restore_reg(host);
+
+#ifdef CONFIG_MMC_CQHCI
+	if (mmc->caps2 & MMC_CAP2_CQE)
+		cqhci_resume(mmc);
+#endif
+	/*
+	 * 1: MSDC_AES_CTL_INIT
+	 * 4: cap_id, no-meaning
+	 * 1: cfg_id, we choose the second cfg group
+	 */
+	if (host->mmc->caps2 & MMC_CAP2_CRYPTO)
+		arm_smccc_smc(MTK_SIP_KERNEL_HW_FDE_MSDC_CTL,
+			1, 4, 1, 0, 0, 0, 0, &smccc_res);
 	return 0;
 }
 #endif
