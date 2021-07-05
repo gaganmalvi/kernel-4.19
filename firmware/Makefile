@@ -9,6 +9,14 @@ fwdir := $(subst $(quote),,$(CONFIG_EXTRA_FIRMWARE_DIR))
 fwabs := $(addprefix $(srctree)/,$(filter-out /%,$(fwdir)))$(filter /%,$(fwdir))
 
 fw-external-y := $(subst $(quote),,$(CONFIG_EXTRA_FIRMWARE))
+fw-external-$(CONFIG_TOUCHSCREEN_ILITEK_ILI9881X) += tsp_ilitek/ili9881x_a12.hex
+fw-external-$(CONFIG_TOUCHSCREEN_NT36xxx_HOSTDL_SPI) += tsp_novatek/nt36525_a12_csot.bin tsp_novatek/nt36525_a12_mp_csot.bin \
+							tsp_novatek/nt36525_a12_dtc.bin tsp_novatek/nt36525_a12_mp_dtc.bin \
+							tsp_novatek/nt36525_a12_boe.bin tsp_novatek/nt36525_a12_mp_boe.bin \
+							tsp_novatek/nt36675_a12_ltps.bin tsp_novatek/nt36675_a12_mp_ltps.bin
+
+fw-external-$(CONFIG_SENSORS_A96T3X6) += abov/a96t356_a12_main.bin abov/a96t356_a12_sub.bin \
+					 abov/a96t356_a12_usa_main.bin abov/a96t356_a12_usa_sub.bin
 
 quiet_cmd_fwbin = MK_FW   $@
       cmd_fwbin = FWNAME="$(patsubst firmware/%.gen.S,%,$@)";		     \
