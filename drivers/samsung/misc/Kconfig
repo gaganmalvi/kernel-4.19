@@ -8,11 +8,11 @@
 menuconfig SEC_MISC
 	bool "Enable Samsung miscellaneous feature"
 	depends on SEC_EXT
-	default y
+	default n
 
 config SEC_BOOTSTAT
 	bool "Enable Samsung Bootstat logging"
-	default y
+	default n
 	depends on SEC_EXT
 	help
 	  Samsung TN Bootstat Feature.
@@ -27,7 +27,7 @@ config SEC_DEVICE_BOOTSTAT
 config SEC_LOG_HOOK_PMSG
 	bool "Enable hooking android platform log for ramdump"
 	depends on SEC_EXT && PSTORE_PMSG
-	default y
+	default n
 	help
 	  This option enables hooking android platform log.
 
