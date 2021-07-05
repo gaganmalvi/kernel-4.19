@@ -99,6 +99,12 @@
 #define IPV6_MAX_STRLEN \
 	sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")
 
+#ifdef CONFIG_MTK_SRIL_SUPPORT
+#define NET_IF_NAME	"rmnet"
+#else
+#define NET_IF_NAME	"ccmni"
+#endif
+
 static inline u32 cstamp_delta(unsigned long cstamp)
 {
 	return (cstamp - INITIAL_JIFFIES) * 100UL / HZ;
@@ -155,7 +161,16 @@ static int ipv6_generate_stable_address(struct in6_addr *addr,
  */
 static struct hlist_head inet6_addr_lst[IN6_ADDR_HSIZE];
 static DEFINE_SPINLOCK(addrconf_hash_lock);
+struct fib6_info *calc_lft_vzw(struct inet6_ifaddr *ifp_vzw,
+			       u32 *min_lft_vzw);
+static void calc_next_vzw(struct inet6_ifaddr *ifp_vzw,
+			  struct fib6_info *rt_vzw,
+			  unsigned long *next_vzw, unsigned long age_vzw,
+			  bool is_expires_vzw, u32 min_lft_vzw);
 
+static int inet6_fill_nora(struct sk_buff *skb, struct inet6_dev *idev,
+			   u32 portid, u32 seq, int event);
+static void inet6_no_ra_notify(int event, struct inet6_dev *idev);
 static void addrconf_verify(void);
 static void addrconf_verify_rtnl(void);
 static void addrconf_verify_work(struct work_struct *);
@@ -186,6 +201,11 @@ static void ipv6_ifa_notify(int event, struct inet6_ifaddr *ifa);
 
 static void inet6_prefix_notify(int event, struct inet6_dev *idev,
 				struct prefix_info *pinfo);
+
+static void inet6_send_rs_vzw(struct inet6_ifaddr *ifp);
+
+static void put_ifaddrmsg(struct nlmsghdr *nlh, u8 prefixlen, u32 flags,
+			  u8 scope, int ifindex);
 
 static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.forwarding		= 0,
@@ -220,6 +240,7 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.accept_ra_rt_info_max_plen = 0,
 #endif
 #endif
+	.accept_ra_rt_table	= 0,
 	.proxy_ndp		= 0,
 	.accept_source_route	= 0,	/* we do not accept RH0 by default. */
 	.disable_ipv6		= 0,
@@ -274,6 +295,7 @@ static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
 	.accept_ra_rt_info_max_plen = 0,
 #endif
 #endif
+	.accept_ra_rt_table	= 0,
 	.proxy_ndp		= 0,
 	.accept_source_route	= 0,	/* we do not accept RH0 by default. */
 	.disable_ipv6		= 0,
@@ -294,6 +316,88 @@ static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
 	.addr_gen_mode		= IN6_ADDR_GEN_MODE_EUI64,
 	.disable_policy		= 0,
 };
+
+/* this is save current operator value */
+int sysctl_optr __read_mostly;
+
+/*Fill skb for  no ra  msg*/
+static int inet6_fill_nora(struct sk_buff *skb, struct inet6_dev *idev,
+			   u32 portid, u32 seq, int event)
+{
+	struct nlmsghdr *nlh;
+
+	unsigned int flag = 1;
+	struct in6_addr addr;
+
+	if ((sysctl_optr == MTK_IPV6_VZW_ALL ||
+	    sysctl_optr == MTK_IPV6_EX_RS_INTERVAL) &&
+		(strncmp(idev->dev->name, NET_IF_NAME, 2) == 0)) {
+		/*This ifi_flags refers to the dev flag in kernel,
+		 *but hereI use it as a valid flag. When ifi_flags
+		 *is zero , it means RA refesh Fail, And When
+		 *ifi_flags is 1, it means RA init Fail! @MTK07384
+		 */
+		/*hdr->ifi_flags = dev_get_flags(dev); */
+		if (idev->if_flags & IF_RS_VZW_SENT) {
+			flag = 0;
+			pr_info("[mtk_net][IPv6] RA refresh Fail\n");
+		} else {
+			flag = 1;
+			pr_info("[mtk_net][IPv6] RA init Fail\n");
+		}
+	}
+
+	nlh = nlmsg_put(skb, portid, seq, event, sizeof(struct ifaddrmsg),
+			flag);
+	if (!nlh)
+		return -EMSGSIZE;
+
+	put_ifaddrmsg(nlh, 64, 01, 01, idev->dev->ifindex);
+
+	/* ipv6 address
+	 * RA refresh Fail - FE80::5A5A:5A22
+	 * RA init Fail - FE80::5A5A:5A23
+	 */
+	addr.in6_u.u6_addr32[0] = 0x000080FE;
+	addr.in6_u.u6_addr32[1] = 0x0;
+	addr.in6_u.u6_addr32[2] = 0x5A005A00;
+	if (flag)
+		addr.in6_u.u6_addr32[3] = 0x23005A00;
+	else
+		addr.in6_u.u6_addr32[3] = 0x22005A00;
+	if (nla_put_in6_addr(skb, IFA_ADDRESS, &addr) < 0)
+		return -EMSGSIZE;
+
+	nlmsg_end(skb, nlh);
+	return 0;
+}
+
+/*send no ra netlink msg*/
+static void inet6_no_ra_notify(int event, struct inet6_dev *idev)
+{
+	struct sk_buff *skb;
+	struct net *net = dev_net(idev->dev);
+	int err = -ENOBUFS;
+	size_t length = NLMSG_ALIGN(sizeof(struct ifinfomsg));
+
+	skb = nlmsg_new(length, GFP_ATOMIC);
+	if (!skb)
+		goto errout;
+
+	err = inet6_fill_nora(skb, idev, 0, 0, event);
+	if (err < 0) {
+		/* -EMSGSIZE implies BUG in inet6_prefix_nlmsg_size() */
+		WARN_ON(err == -EMSGSIZE);
+		kfree_skb(skb);
+		goto errout;
+	}
+
+	rtnl_notify(skb, net, 0, RTNLGRP_IPV6_IFADDR, NULL, GFP_ATOMIC);
+	return;
+errout:
+	if (err < 0)
+		rtnl_set_sk_err(net, RTNLGRP_IPV6_IFADDR, err);
+}
 
 /* Check if link is ready: is it up and is a valid qdisc available */
 static inline bool addrconf_link_ready(const struct net_device *dev)
@@ -2313,6 +2417,26 @@ static void  ipv6_try_regen_rndid(struct inet6_dev *idev, struct in6_addr *tmpad
 		ipv6_regen_rndid(idev);
 }
 
+u32 addrconf_rt_table(const struct net_device *dev, u32 default_table)
+{
+	struct inet6_dev *idev = in6_dev_get(dev);
+	int sysctl;
+	u32 table;
+
+	if (!idev)
+		return default_table;
+	sysctl = idev->cnf.accept_ra_rt_table;
+	if (sysctl == 0) {
+		table = default_table;
+	} else if (sysctl > 0) {
+		table = (u32) sysctl;
+	} else {
+		table = (unsigned) dev->ifindex + (-sysctl);
+	}
+	in6_dev_put(idev);
+	return table;
+}
+
 /*
  *	Add prefix route.
  */
@@ -2323,7 +2447,7 @@ addrconf_prefix_route(struct in6_addr *pfx, int plen, u32 metric,
 		      u32 flags, gfp_t gfp_flags)
 {
 	struct fib6_config cfg = {
-		.fc_table = l3mdev_fib_table(dev) ? : RT6_TABLE_PREFIX,
+		.fc_table = l3mdev_fib_table(dev) ? : addrconf_rt_table(dev, RT6_TABLE_PREFIX),
 		.fc_metric = metric ? : IP6_RT_PRIO_ADDRCONF,
 		.fc_ifindex = dev->ifindex,
 		.fc_expires = expires,
@@ -2357,7 +2481,7 @@ static struct fib6_info *addrconf_get_prefix_route(const struct in6_addr *pfx,
 	struct fib6_node *fn;
 	struct fib6_info *rt = NULL;
 	struct fib6_table *table;
-	u32 tb_id = l3mdev_fib_table(dev) ? : RT6_TABLE_PREFIX;
+	u32 tb_id = l3mdev_fib_table(dev) ? : addrconf_rt_table(dev, RT6_TABLE_PREFIX);
 
 	table = fib6_get_table(dev_net(dev), tb_id);
 	if (!table)
@@ -3289,6 +3413,7 @@ static void addrconf_dev_config(struct net_device *dev)
 	    (dev->type != ARPHRD_INFINIBAND) &&
 	    (dev->type != ARPHRD_IEEE1394) &&
 	    (dev->type != ARPHRD_TUNNEL6) &&
+	    (dev->type != ARPHRD_PUREIP) &&
 	    (dev->type != ARPHRD_6LOWPAN) &&
 	    (dev->type != ARPHRD_IP6GRE) &&
 	    (dev->type != ARPHRD_IPGRE) &&
@@ -3305,6 +3430,10 @@ static void addrconf_dev_config(struct net_device *dev)
 
 	idev = addrconf_add_dev(dev);
 	if (IS_ERR(idev))
+		return;
+
+	/*mobile device  doesn't  need  auto-linklocal addr  */
+	if (dev->type == ARPHRD_PUREIP)
 		return;
 
 	/* this device type has no EUI support */
@@ -3837,14 +3966,29 @@ static void addrconf_rs_timer(struct timer_list *t)
 			goto put;
 
 		write_lock(&idev->lock);
-		idev->rs_interval = rfc3315_s14_backoff_update(
-			idev->rs_interval, idev->cnf.rtr_solicit_max_interval);
+
+		if (sysctl_optr == MTK_IPV6_VZW_ALL &&
+		    (strncmp(dev->name, NET_IF_NAME, 2) == 0))
+			idev->rs_interval = idev->cnf.rtr_solicit_interval;
+		else
+			idev->rs_interval = rfc3315_s14_backoff_update
+				(idev->rs_interval,
+				 idev->cnf.rtr_solicit_max_interval);
+
 		/* The wait after the last probe can be shorter */
 		addrconf_mod_rs_timer(idev, (idev->rs_probes ==
 					     idev->cnf.rtr_solicits) ?
 				      idev->cnf.rtr_solicit_delay :
 				      idev->rs_interval);
 	} else {
+		inet6_no_ra_notify(RTM_DELADDR, idev);
+		if ((sysctl_optr == MTK_IPV6_VZW_ALL ||
+		    sysctl_optr == MTK_IPV6_EX_RS_INTERVAL) &&
+			(strncmp(dev->name, NET_IF_NAME, 2) == 0)) {
+			/*add for VzW feature : remove IF_RS_VZW_SENT flag*/
+			if (idev->if_flags & IF_RS_VZW_SENT)
+				idev->if_flags &= ~IF_RS_VZW_SENT;
+		}
 		/*
 		 * Note: we do not support deprecated "all on-link"
 		 * assumption any longer.
@@ -4152,8 +4296,14 @@ static void addrconf_dad_completed(struct inet6_ifaddr *ifp, bool bump_id,
 
 		write_lock_bh(&ifp->idev->lock);
 		spin_lock(&ifp->lock);
-		ifp->idev->rs_interval = rfc3315_s14_backoff_init(
-			ifp->idev->cnf.rtr_solicit_interval);
+		if (sysctl_optr == MTK_IPV6_VZW_ALL &&
+		    (strncmp(dev->name, NET_IF_NAME, 2) == 0))
+			ifp->idev->rs_interval =
+				ifp->idev->cnf.rtr_solicit_interval;
+		else
+			ifp->idev->rs_interval = rfc3315_s14_backoff_init
+				(ifp->idev->cnf.rtr_solicit_interval);
+
 		ifp->idev->rs_probes = 1;
 		ifp->idev->if_flags |= IF_RS_SENT;
 		addrconf_mod_rs_timer(ifp->idev, ifp->idev->rs_interval);
@@ -4349,6 +4499,86 @@ int ipv6_chk_home_addr(struct net *net, const struct in6_addr *addr)
 }
 #endif
 
+static void inet6_send_rs_vzw(struct inet6_ifaddr *ifp)
+{
+	struct net_device *dev = ifp->idev->dev;
+
+	/*struct inet6_ifaddr *linklocal_ifp = NULL;*/
+	pr_info("[mtk_net][IPv6][%s] dev name:%s\n", __func__, dev->name);
+
+	/*because of using link local address will triger KE
+	 *so this first using global address
+	 */
+	if (ipv6_accept_ra(ifp->idev) &&
+	    ifp->idev->cnf.rtr_solicits > 0 &&
+	    (dev->flags & IFF_LOOPBACK) == 0) {
+		pr_info("[mtk_net][IPv6][%s] send refresh rs: dev name:%s\n",
+			__func__, dev->name);
+		ndisc_send_rs(ifp->idev->dev, &ifp->addr,
+			      &in6addr_linklocal_allrouters);
+
+		/*disable  softirq */
+		local_bh_disable();
+		/*Kernel3.18 ifp->idev->rs_probes*/
+		/*Kernel3.10 ifp->probes = 1*/
+		ifp->idev->rs_probes = 1;
+		/*ifp->probes = 1; */
+		ifp->idev->if_flags |= IF_RS_SENT;
+		ifp->idev->if_flags |= IF_RS_VZW_SENT;
+
+		if (ifp->idev->if_flags & IF_RA_RCVD) {
+			pr_info("[mtk_net][IPv6] ifp: has IF_RA_RCVD flag, and will clear it\n");
+			ifp->idev->if_flags &= ~IF_RA_RCVD;
+		}
+		/*Kernel3.10 addrconf_mod_timer
+		 *Kernel3.18 addrconf_mod_rs_timer
+		 */
+		addrconf_mod_rs_timer(ifp->idev,
+				      ifp->idev->cnf.rtr_solicit_interval);
+		local_bh_enable();
+	}
+}
+
+struct fib6_info *calc_lft_vzw(struct inet6_ifaddr *ifp_vzw, u32 *min_lft_vzw)
+{
+	struct fib6_info *rt_vzw;
+	u32 route_lft;
+
+	rt_vzw = rt6_get_dflt_router_expires(ifp_vzw->idev->dev);
+	if (rt_vzw && (rt_vzw->fib6_flags & RTF_EXPIRES)) {
+		route_lft = (rt_vzw->expires - ifp_vzw->tstamp) / HZ;
+		*min_lft_vzw = min(ifp_vzw->prefered_lft, route_lft);
+		pr_info("[mtk_net]RA: min_lft %lld\n", (u64)(*min_lft_vzw));
+	} else {
+		*min_lft_vzw = ifp_vzw->prefered_lft;
+	}
+	return rt_vzw;
+}
+
+static void calc_next_vzw(struct inet6_ifaddr *ifp_vzw,
+			  struct fib6_info *rt_vzw,
+			  unsigned long *next_vzw, unsigned long age_vzw,
+			  bool is_expires_vzw, u32 min_lft_vzw)
+{
+	if (strncmp(ifp_vzw->idev->dev->name, NET_IF_NAME, 2) == 0) {
+		if (is_expires_vzw ||
+		    (rt_vzw && (rt_vzw->fib6_flags & RTF_EXPIRES))) {
+			if (!(ifp_vzw->idev->if_flags & IF_RS_VZW_SENT) &&
+			    (age_vzw >= (min_lft_vzw * 3 / 4)))
+				inet6_send_rs_vzw(ifp_vzw);
+
+			pr_info("[mtk_net][IPv6] min_lft=%lld, age=%lld, is_expires=%d\n",
+				(u64)min_lft_vzw, (u64)age_vzw, is_expires_vzw);
+
+			if (!(ifp_vzw->idev->if_flags & IF_RS_VZW_SENT) &&
+			    time_before(ifp_vzw->tstamp +
+			    ((min_lft_vzw * 3 / 4) * HZ), *next_vzw))
+				*next_vzw = ifp_vzw->tstamp +
+				       ((min_lft_vzw * 3 / 4) * HZ);
+		}
+	}
+}
+
 /*
  *	Periodic address status verification
  */
@@ -4371,7 +4601,13 @@ static void addrconf_verify_rtnl(void)
 restart:
 		hlist_for_each_entry_rcu_bh(ifp, &inet6_addr_lst[i], addr_lst) {
 			unsigned long age;
+			u32 min_lft;
+			struct fib6_info *rt = NULL;
 
+			if ((sysctl_optr == MTK_IPV6_VZW_ALL ||
+				sysctl_optr == MTK_IPV6_EX_RS_INTERVAL) &&
+				(strncmp(ifp->idev->dev->name, NET_IF_NAME, 2) == 0))
+				rt = calc_lft_vzw(ifp, &min_lft);
 			/* When setting preferred_lft to a value not zero or
 			 * infinity, while valid_lft is infinity
 			 * IFA_F_PERMANENT has a non-infinity life time.
@@ -4391,6 +4627,17 @@ restart:
 				ipv6_del_addr(ifp);
 				goto restart;
 			} else if (ifp->prefered_lft == INFINITY_LIFE_TIME) {
+				if ((sysctl_optr == MTK_IPV6_VZW_ALL ||
+					sysctl_optr == MTK_IPV6_EX_RS_INTERVAL) &&
+					(strncmp(ifp->idev->dev->name, NET_IF_NAME, 2) == 0)) {
+					/*Patch for VzW
+					 *prefered_lft is INFINITY scenario
+					 *ccmni interface will send RS when
+					 *time flow reaches 75% of route_lft
+					 */
+					calc_next_vzw(ifp, rt, &next, age,
+						      0, min_lft);
+				}
 				spin_unlock(&ifp->lock);
 				continue;
 			} else if (age >= ifp->prefered_lft) {
@@ -4448,6 +4695,18 @@ restart:
 				/* ifp->prefered_lft <= ifp->valid_lft */
 				if (time_before(ifp->tstamp + ifp->prefered_lft * HZ, next))
 					next = ifp->tstamp + ifp->prefered_lft * HZ;
+				if ((sysctl_optr == MTK_IPV6_VZW_ALL ||
+					sysctl_optr == MTK_IPV6_EX_RS_INTERVAL) &&
+					(strncmp(ifp->idev->dev->name, NET_IF_NAME, 2) == 0)) {
+					/*patch for VzW
+					 *prefered_lft is NOT INFINITY scenario
+					 *ccmni interface will send RS when time
+					 *flow reaches 75% of min{prefered_lft,
+					 *route_lft}
+					 */
+					calc_next_vzw(ifp, rt, &next, age,
+						      1, min_lft);
+				}
 				spin_unlock(&ifp->lock);
 			}
 		}
@@ -5433,8 +5692,14 @@ update_lft:
 
 	if (update_rs) {
 		idev->if_flags |= IF_RS_SENT;
-		idev->rs_interval = rfc3315_s14_backoff_init(
-			idev->cnf.rtr_solicit_interval);
+
+		if (sysctl_optr == MTK_IPV6_VZW_ALL &&
+		    (strncmp(dev->name, NET_IF_NAME, 2) == 0))
+			idev->rs_interval = idev->cnf.rtr_solicit_interval;
+		else
+			idev->rs_interval = rfc3315_s14_backoff_init
+				(idev->cnf.rtr_solicit_interval);
+
 		idev->rs_probes = 1;
 		addrconf_mod_rs_timer(idev, idev->rs_interval);
 	}
@@ -6393,6 +6658,13 @@ static const struct ctl_table addrconf_sysctl[] = {
 	},
 #endif
 #endif
+	{
+		.procname	= "accept_ra_rt_table",
+		.data		= &ipv6_devconf.accept_ra_rt_table,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
 	{
 		.procname	= "proxy_ndp",
 		.data		= &ipv6_devconf.proxy_ndp,
